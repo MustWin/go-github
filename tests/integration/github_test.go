@@ -11,12 +11,12 @@ package tests
 
 import (
 	"fmt"
+	"math/rand"
+	"net/http"
 	"os"
 
 	"github.com/google/go-github/github"
 	"golang.org/x/oauth2"
-	"net/http"
-	"math/rand"
 )
 
 var (
@@ -39,6 +39,17 @@ func init() {
 		client = github.NewClient(tc)
 		auth = true
 	}
+
+	// Environment variables required for Authorization integration tests
+	vars := []string{envKeyGitHubUsername, envKeyGitHubPassword, envKeyClientID, envKeyClientSecret}
+
+	for _, v := range vars {
+		value := os.Getenv(v)
+		if value == "" {
+			print("!!! " + fmt.Sprintf(msgEnvMissing, v) + " !!!\n\n")
+		}
+	}
+
 }
 
 func checkAuth(name string) bool {
@@ -56,7 +67,7 @@ func createRandomTestRepository(owner string, autoinit bool) (*github.Repository
 		_, resp, err := client.Repositories.Get(owner, repoName)
 		if err != nil {
 			if resp.StatusCode == http.StatusNotFound {
-				// found a non-existant repo, perfect
+				// found a non-existent repo, perfect
 				break
 			}
 
@@ -65,7 +76,7 @@ func createRandomTestRepository(owner string, autoinit bool) (*github.Repository
 	}
 
 	// create the repository
-	repo, _, err := client.Repositories.Create("", &github.Repository{Name: github.String(repoName), AutoInit:github.Bool(autoinit)})
+	repo, _, err := client.Repositories.Create("", &github.Repository{Name: github.String(repoName), AutoInit: github.Bool(autoinit)})
 	if err != nil {
 		return nil, err
 	}

@@ -24,6 +24,11 @@ import (
 )
 
 const (
+	// StatusUnprocessableEntity is the status code returned when sending a request with invalid fields.
+	StatusUnprocessableEntity = 422
+)
+
+const (
 	libraryVersion = "0.1"
 	defaultBaseURL = "https://api.github.com/"
 	uploadBaseURL  = "https://uploads.github.com/"
@@ -51,12 +56,23 @@ const (
 
 	// https://developer.github.com/changes/2015-11-11-protected-branches-api/
 	mediaTypeProtectedBranchesPreview = "application/vnd.github.loki-preview+json"
+
+	// https://developer.github.com/changes/2016-02-11-issue-locking-api/
+	mediaTypeIssueLockingPreview = "application/vnd.github.the-key-preview+json"
+
+	// https://developer.github.com/changes/2016-02-24-commit-reference-sha-api/
+	mediaTypeCommitReferenceSHAPreview = "application/vnd.github.chitauri-preview+sha"
+
+	// https://help.github.com/enterprise/2.4/admin/guides/migrations/exporting-the-github-com-organization-s-repositories/
+	mediaTypeMigrationsPreview = "application/vnd.github.wyandotte-preview+json"
 )
 
 // A Client manages communication with the GitHub API.
 type Client struct {
 	// HTTP client used to communicate with the API.
 	client *http.Client
+	// clientMu protects the client during calls that modify the CheckRedirect func.
+	clientMu sync.Mutex
 
 	// Base URL for API requests.  Defaults to the public GitHub API, but can be
 	// set to a domain endpoint to use with GitHub Enterprise.  BaseURL should
@@ -70,20 +86,22 @@ type Client struct {
 	UserAgent string
 
 	rateMu sync.Mutex
-	rate   Rate
+	rate   Rate // Rate limit for the client as determined by the most recent API call.
 
 	// Services used for talking to different parts of the GitHub API.
-	Activity      *ActivityService
-	Gists         *GistsService
-	Git           *GitService
-	Gitignores    *GitignoresService
-	Issues        *IssuesService
-	Organizations *OrganizationsService
-	PullRequests  *PullRequestsService
-	Repositories  *RepositoriesService
-	Search        *SearchService
-	Users         *UsersService
-	Licenses      *LicensesService
+	Activity       *ActivityService
+	Authorizations *AuthorizationsService
+	Gists          *GistsService
+	Git            *GitService
+	Gitignores     *GitignoresService
+	Issues         *IssuesService
+	Organizations  *OrganizationsService
+	PullRequests   *PullRequestsService
+	Repositories   *RepositoriesService
+	Search         *SearchService
+	Users          *UsersService
+	Licenses       *LicensesService
+	Migrations     *MigrationService
 }
 
 // ListOptions specifies the optional parameters to various List methods that
@@ -136,6 +154,7 @@ func NewClient(httpClient *http.Client) *Client {
 
 	c := &Client{client: httpClient, BaseURL: baseURL, UserAgent: userAgent, UploadURL: uploadURL}
 	c.Activity = &ActivityService{client: c}
+	c.Authorizations = &AuthorizationsService{client: c}
 	c.Gists = &GistsService{client: c}
 	c.Git = &GitService{client: c}
 	c.Gitignores = &GitignoresService{client: c}
@@ -146,6 +165,7 @@ func NewClient(httpClient *http.Client) *Client {
 	c.Search = &SearchService{client: c}
 	c.Users = &UsersService{client: c}
 	c.Licenses = &LicensesService{client: c}
+	c.Migrations = &MigrationService{client: c}
 	return c
 }
 
@@ -231,12 +251,12 @@ type Response struct {
 func newResponse(r *http.Response) *Response {
 	response := &Response{Response: r}
 	response.populatePageValues()
-	response.populateRate()
+	response.Rate = parseRate(r)
 	return response
 }
 
 // populatePageValues parses the HTTP Link response headers and populates the
-// various pagination link values in the Reponse.
+// various pagination link values in the Response.
 func (r *Response) populatePageValues() {
 	if links, ok := r.Response.Header["Link"]; ok && len(links) > 0 {
 		for _, link := range strings.Split(links[0], ",") {
@@ -279,19 +299,21 @@ func (r *Response) populatePageValues() {
 	}
 }
 
-// populateRate parses the rate related headers and populates the response Rate.
-func (r *Response) populateRate() {
+// parseRate parses the rate related headers.
+func parseRate(r *http.Response) Rate {
+	var rate Rate
 	if limit := r.Header.Get(headerRateLimit); limit != "" {
-		r.Rate.Limit, _ = strconv.Atoi(limit)
+		rate.Limit, _ = strconv.Atoi(limit)
 	}
 	if remaining := r.Header.Get(headerRateRemaining); remaining != "" {
-		r.Rate.Remaining, _ = strconv.Atoi(remaining)
+		rate.Remaining, _ = strconv.Atoi(remaining)
 	}
 	if reset := r.Header.Get(headerRateReset); reset != "" {
 		if v, _ := strconv.ParseInt(reset, 10, 64); v != 0 {
-			r.Rate.Reset = Timestamp{time.Unix(v, 0)}
+			rate.Reset = Timestamp{time.Unix(v, 0)}
 		}
 	}
+	return rate
 }
 
 // Rate specifies the current rate limit for the client as determined by the
@@ -316,7 +338,11 @@ func (c *Client) Do(req *http.Request, v interface{}) (*Response, error) {
 		return nil, err
 	}
 
-	defer resp.Body.Close()
+	defer func() {
+		// Drain up to 512 bytes and close the body to let the Transport reuse the connection
+		io.CopyN(ioutil.Discard, resp.Body, 512)
+		resp.Body.Close()
+	}()
 
 	response := newResponse(resp)
 
@@ -341,6 +367,7 @@ func (c *Client) Do(req *http.Request, v interface{}) (*Response, error) {
 			}
 		}
 	}
+
 	return response, err
 }
 
@@ -353,6 +380,13 @@ type ErrorResponse struct {
 	Response *http.Response // HTTP response that caused this error
 	Message  string         `json:"message"` // error message
 	Errors   []Error        `json:"errors"`  // more detail on individual errors
+	// Block is only populated on certain types of errors such as code 451.
+	// See https://developer.github.com/changes/2016-03-17-the-451-status-code-is-now-supported/
+	// for more information.
+	Block *struct {
+		Reason    string     `json:"reason,omitempty"`
+		CreatedAt *Timestamp `json:"created_at,omitempty"`
+	} `json:"block,omitempty"`
 }
 
 func (r *ErrorResponse) Error() string {
@@ -367,6 +401,20 @@ func (r *ErrorResponse) Error() string {
 type TwoFactorAuthError ErrorResponse
 
 func (r *TwoFactorAuthError) Error() string { return (*ErrorResponse)(r).Error() }
+
+// RateLimitError occurs when GitHub returns 403 Forbidden response with a rate limit
+// remaining value of 0, and error message starts with "API rate limit exceeded for ".
+type RateLimitError struct {
+	Rate     Rate           // Rate specifies last known rate limit for the client
+	Response *http.Response // HTTP response that caused this error
+	Message  string         `json:"message"` // error message
+}
+
+func (r *RateLimitError) Error() string {
+	return fmt.Sprintf("%v %v: %d %v; rate reset in %v",
+		r.Response.Request.Method, sanitizeURL(r.Response.Request.URL),
+		r.Response.StatusCode, r.Message, r.Rate.Reset.Time.Sub(time.Now()))
+}
 
 // sanitizeURL redacts the client_secret parameter from the URL which may be
 // exposed to the user, specifically in the ErrorResponse error message.
@@ -413,6 +461,9 @@ func (e *Error) Error() string {
 // the 200 range.  API error responses are expected to have either no response
 // body, or a JSON response body that maps to ErrorResponse.  Any other
 // response body will be silently ignored.
+//
+// The error type will be *RateLimitError for rate limit exceeded errors,
+// and *TwoFactorAuthError for two-factor authentication errors.
 func CheckResponse(r *http.Response) error {
 	if c := r.StatusCode; 200 <= c && c <= 299 {
 		return nil
@@ -422,10 +473,18 @@ func CheckResponse(r *http.Response) error {
 	if err == nil && data != nil {
 		json.Unmarshal(data, errorResponse)
 	}
-	if r.StatusCode == http.StatusUnauthorized && strings.HasPrefix(r.Header.Get(headerOTP), "required") {
+	switch {
+	case r.StatusCode == http.StatusUnauthorized && strings.HasPrefix(r.Header.Get(headerOTP), "required"):
 		return (*TwoFactorAuthError)(errorResponse)
+	case r.StatusCode == http.StatusForbidden && r.Header.Get(headerRateRemaining) == "0" && strings.HasPrefix(errorResponse.Message, "API rate limit exceeded for "):
+		return &RateLimitError{
+			Rate:     parseRate(r),
+			Response: errorResponse.Response,
+			Message:  errorResponse.Message,
+		}
+	default:
+		return errorResponse
 	}
-	return errorResponse
 }
 
 // parseBoolResponse determines the boolean result from a GitHub API response.
@@ -482,7 +541,7 @@ func (r RateLimits) String() string {
 	return Stringify(r)
 }
 
-// RateLimit is deprecated.  Use RateLimits instead.
+// Deprecated: RateLimit is deprecated, use RateLimits instead.
 func (c *Client) RateLimit() (*Rate, *Response, error) {
 	limits, resp, err := c.RateLimits()
 	if limits == nil {
